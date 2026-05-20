@@ -1,18 +1,120 @@
 #include "codegen.hpp"
 #include "error.hpp"
+
+#include <algorithm>
 #include <string>
 
-Bytecode BytecodeGenerator::generate(Program& program, int localCount) {
-    bytecode_ = Bytecode{};
-    bytecode_.localCount = localCount;
+namespace minilang {
 
-    if (!program.mainFunction) {
-        throw SemanticError(program.loc, "cannot generate bytecode: missing main function");
+void BytecodeGenerator::setDiagnostic(SourceLocation location, const std::string& message) {
+    if (diagnostic_) {
+        return;
     }
 
-    generateMainFunction(*program.mainFunction);
+    diagnostic_ = Diagnostic(location, message);
+}
+
+void BytecodeGenerator::failVoid(SourceLocation location, const std::string& message) {
+    setDiagnostic(location, message);
+}
+
+static std::string metaTypeName(const Expr& expr) {
+    if ((expr.inferredType == Type::Struct || expr.inferredType == Type::Generic) &&
+        !expr.inferredStructName.empty()) {
+        return expr.inferredStructName;
+    }
+
+    return typeToString(expr.inferredType);
+}
+
+static int metaSizeOf(const Expr& expr) {
+    switch (expr.inferredType) {
+        case Type::Int:
+            return 4;
+
+        case Type::UInt:
+            return 4;
+
+        case Type::Float:
+            return 8;
+
+        case Type::Bool:
+            return 1;
+
+        case Type::String:
+            return 8;
+
+        case Type::IntArray:
+            if (expr.inferredArraySize > 0) {
+                return expr.inferredArraySize * 4;
+            }
+
+            return 8;
+
+        case Type::Struct:
+            return 8;
+
+        case Type::Generic:
+            return 8;
+
+        case Type::Void:
+        case Type::Unknown:
+            return 0;
+    }
+
+    return 0;
+}
+
+Result<Bytecode> BytecodeGenerator::generateExpected(Program& program) {
+    diagnostic_.reset();
+
+    Bytecode result = generate(program);
+
+    if (diagnostic_) {
+        return std::unexpected(*diagnostic_);
+    }
+
+    return result;
+}
+
+Bytecode BytecodeGenerator::generate(Program& program) {
+    bytecode_ = Bytecode{};
+    loopStack_.clear();
+    switchBreakStack_.clear();
+
+    prepareFunctionTable(program);
+
+    for (auto& function : program.functions) {
+        generateFunction(*function);
+    }
+
+    if (bytecode_.entryFunction < 0) {
+        return fail<Bytecode>(program.loc, "cannot generate bytecode: missing main function");
+    }
 
     return bytecode_;
+}
+
+void BytecodeGenerator::prepareFunctionTable(Program& program) {
+    bytecode_.functions.clear();
+
+    for (auto& function : program.functions) {
+        FunctionInfo info;
+        info.name = function->name;
+        info.returnType = function->returnType;
+        info.localCount = function->localCount;
+        info.address = -1;
+
+        for (const Parameter& parameter : function->parameters) {
+            info.parameterTypes.push_back(parameter.type);
+        }
+
+        bytecode_.functions.push_back(info);
+
+        if (function->name == "main") {
+            bytecode_.entryFunction = function->functionIndex;
+        }
+    }
 }
 
 int BytecodeGenerator::currentAddress() const {
@@ -31,14 +133,27 @@ int BytecodeGenerator::emitJump(OpCode op, SourceLocation location) {
 void BytecodeGenerator::patchJump(int instructionIndex, int targetAddress) {
     if (instructionIndex < 0 ||
         instructionIndex >= static_cast<int>(bytecode_.code.size())) {
-        throw RuntimeError(SourceLocation(), "invalid jump patch index");
+        failVoid(SourceLocation(), "invalid jump patch index");
+    return;
     }
 
     bytecode_.code[instructionIndex].intArg = targetAddress;
 }
 
-void BytecodeGenerator::generateMainFunction(MainFunction& function) {
+void BytecodeGenerator::generateFunction(FunctionDecl& function) {
+    if (function.functionIndex < 0 ||
+        function.functionIndex >= static_cast<int>(bytecode_.functions.size())) {
+        failVoid(function.loc, "internal error: invalid function index");
+    return;
+    }
+
+    bytecode_.functions[function.functionIndex].address = currentAddress();
+
     generateBlock(*function.body);
+
+
+    emitDefaultValue(function.returnType, -1, function.loc);
+    emit(Instruction(OpCode::Ret, function.loc));
 }
 
 void BytecodeGenerator::generateBlock(BlockStmt& block) {
@@ -48,6 +163,15 @@ void BytecodeGenerator::generateBlock(BlockStmt& block) {
 }
 
 void BytecodeGenerator::generateStmt(Stmt& stmt) {
+    if (dynamic_cast<EmptyStmt*>(&stmt)) {
+        return;
+    }
+
+    if (auto* s = dynamic_cast<ExprStmt*>(&stmt)) {
+        generateExprStmt(*s);
+        return;
+    }
+
     if (auto* s = dynamic_cast<BlockStmt*>(&stmt)) {
         generateBlock(*s);
         return;
@@ -63,6 +187,16 @@ void BytecodeGenerator::generateStmt(Stmt& stmt) {
         return;
     }
 
+    if (auto* s = dynamic_cast<ArrayAssignStmt*>(&stmt)) {
+        generateArrayAssignStmt(*s);
+        return;
+    }
+
+    if (auto* s = dynamic_cast<FieldAssignStmt*>(&stmt)) {
+        generateFieldAssignStmt(*s);
+        return;
+    }
+
     if (auto* s = dynamic_cast<IfStmt*>(&stmt)) {
         generateIfStmt(*s);
         return;
@@ -73,8 +207,28 @@ void BytecodeGenerator::generateStmt(Stmt& stmt) {
         return;
     }
 
+    if (auto* s = dynamic_cast<ForStmt*>(&stmt)) {
+        generateForStmt(*s);
+        return;
+    }
+
+    if (auto* s = dynamic_cast<SwitchStmt*>(&stmt)) {
+        generateSwitchStmt(*s);
+        return;
+    }
+
     if (auto* s = dynamic_cast<ReturnStmt*>(&stmt)) {
         generateReturnStmt(*s);
+        return;
+    }
+
+    if (auto* s = dynamic_cast<BreakStmt*>(&stmt)) {
+        generateBreakStmt(*s);
+        return;
+    }
+
+    if (auto* s = dynamic_cast<ContinueStmt*>(&stmt)) {
+        generateContinueStmt(*s);
         return;
     }
 
@@ -83,18 +237,28 @@ void BytecodeGenerator::generateStmt(Stmt& stmt) {
         return;
     }
 
-    throw SemanticError(stmt.loc, "cannot generate bytecode for unknown statement");
+    failVoid(stmt.loc, "cannot generate bytecode for unknown statement");
+    return;
+}
+
+void BytecodeGenerator::generateExprStmt(ExprStmt& stmt) {
+    generateExpr(*stmt.expression);
+
+    if (stmt.expression->inferredType != Type::Void) {
+        emit(Instruction(OpCode::Pop, stmt.loc));
+    }
 }
 
 void BytecodeGenerator::generateVarDeclStmt(VarDeclStmt& stmt) {
     if (stmt.localIndex < 0) {
-        throw SemanticError(stmt.loc, "internal error: variable has no local index");
+        failVoid(stmt.loc, "internal error: variable has no local index");
+    return;
     }
 
     if (stmt.initializer) {
         generateExpr(*stmt.initializer);
     } else {
-        emitDefaultValue(stmt.type, stmt.loc);
+        emitDefaultValue(stmt.type, stmt.arraySize, stmt.loc);
     }
 
     emit(Instruction(OpCode::Store, stmt.localIndex, stmt.loc));
@@ -102,12 +266,41 @@ void BytecodeGenerator::generateVarDeclStmt(VarDeclStmt& stmt) {
 
 void BytecodeGenerator::generateAssignStmt(AssignStmt& stmt) {
     if (stmt.localIndex < 0) {
-        throw SemanticError(stmt.loc, "internal error: assignment target has no local index");
+        failVoid(stmt.loc, "internal error: assignment target has no local index");
+    return;
+    }
+
+    generateExpr(*stmt.value);
+    emit(Instruction(OpCode::Store, stmt.localIndex, stmt.loc));
+}
+
+void BytecodeGenerator::generateArrayAssignStmt(ArrayAssignStmt& stmt) {
+    if (stmt.localIndex < 0) {
+        failVoid(stmt.loc, "internal error: array assignment target has no local index");
+    return;
+    }
+
+    generateExpr(*stmt.index);
+    generateExpr(*stmt.value);
+
+    emit(Instruction(OpCode::StoreIndex, stmt.localIndex, stmt.loc));
+}
+
+void BytecodeGenerator::generateFieldAssignStmt(FieldAssignStmt& stmt) {
+    if (stmt.localIndex < 0 || stmt.fieldIndex < 0) {
+        failVoid(stmt.loc,
+            "internal error: field assignment has invalid indexes");
+    return;
     }
 
     generateExpr(*stmt.value);
 
-    emit(Instruction(OpCode::Store, stmt.localIndex, stmt.loc));
+    emit(Instruction(
+        OpCode::StoreField,
+        stmt.localIndex,
+        stmt.fieldIndex,
+        stmt.loc
+    ));
 }
 
 void BytecodeGenerator::generateIfStmt(IfStmt& stmt) {
@@ -140,16 +333,148 @@ void BytecodeGenerator::generateWhileStmt(WhileStmt& stmt) {
 
     int jumpToEnd = emitJump(OpCode::JumpIfFalse, stmt.loc);
 
+    LoopContext context;
+    context.continueTarget = startAddress;
+    loopStack_.push_back(context);
+
     generateStmt(*stmt.body);
 
     emit(Instruction(OpCode::Jump, startAddress, stmt.loc));
 
     int endAddress = currentAddress();
+
     patchJump(jumpToEnd, endAddress);
+
+    for (int jumpIndex : loopStack_.back().breakJumps) {
+        patchJump(jumpIndex, endAddress);
+    }
+
+    for (int jumpIndex : loopStack_.back().continueJumps) {
+        patchJump(jumpIndex, loopStack_.back().continueTarget);
+    }
+
+    loopStack_.pop_back();
+}
+
+void BytecodeGenerator::generateForStmt(ForStmt& stmt) {
+    if (stmt.initializer) {
+        generateStmt(*stmt.initializer);
+    }
+
+    int conditionAddress = currentAddress();
+
+    generateExpr(*stmt.condition);
+
+    int jumpToEnd = emitJump(OpCode::JumpIfFalse, stmt.loc);
+
+    LoopContext context;
+    context.continueTarget = -1;
+    loopStack_.push_back(context);
+
+    generateStmt(*stmt.body);
+
+    int updateAddress = currentAddress();
+
+    for (int jumpIndex : loopStack_.back().continueJumps) {
+        patchJump(jumpIndex, updateAddress);
+    }
+
+    if (stmt.update) {
+        generateStmt(*stmt.update);
+    }
+
+    emit(Instruction(OpCode::Jump, conditionAddress, stmt.loc));
+
+    int endAddress = currentAddress();
+
+    patchJump(jumpToEnd, endAddress);
+
+    for (int jumpIndex : loopStack_.back().breakJumps) {
+        patchJump(jumpIndex, endAddress);
+    }
+
+    loopStack_.pop_back();
+}
+
+void BytecodeGenerator::generateSwitchStmt(SwitchStmt& stmt) {
+    std::vector<int> jumpToCase;
+
+    for (auto& switchCase : stmt.cases) {
+        generateExpr(*stmt.expression);
+        emit(Instruction(OpCode::PushInt, switchCase.value, switchCase.loc));
+        emit(Instruction(OpCode::Equal, switchCase.loc));
+
+        int jumpIndex = emitJump(OpCode::JumpIfTrue, switchCase.loc);
+        jumpToCase.push_back(jumpIndex);
+    }
+
+    int jumpToDefaultOrEnd = emitJump(OpCode::Jump, stmt.loc);
+
+    switchBreakStack_.push_back({});
+
+    for (std::size_t i = 0; i < stmt.cases.size(); ++i) {
+        int caseAddress = currentAddress();
+        patchJump(jumpToCase[i], caseAddress);
+
+        for (auto& statement : stmt.cases[i].statements) {
+            generateStmt(*statement);
+        }
+    }
+
+    if (stmt.hasDefault) {
+        int defaultAddress = currentAddress();
+        patchJump(jumpToDefaultOrEnd, defaultAddress);
+
+        for (auto& statement : stmt.defaultStatements) {
+            generateStmt(*statement);
+        }
+    } else {
+        int endAddress = currentAddress();
+        patchJump(jumpToDefaultOrEnd, endAddress);
+    }
+
+    int endAddress = currentAddress();
+
+    for (int jumpIndex : switchBreakStack_.back()) {
+        patchJump(jumpIndex, endAddress);
+    }
+
+    switchBreakStack_.pop_back();
+}
+
+void BytecodeGenerator::generateBreakStmt(BreakStmt& stmt) {
+    if (!switchBreakStack_.empty()) {
+        int jumpIndex = emitJump(OpCode::Jump, stmt.loc);
+        switchBreakStack_.back().push_back(jumpIndex);
+        return;
+    }
+
+    if (loopStack_.empty()) {
+        failVoid(stmt.loc, "internal error: 'break' outside loop");
+    return;
+    }
+
+    int jumpIndex = emitJump(OpCode::Jump, stmt.loc);
+    loopStack_.back().breakJumps.push_back(jumpIndex);
+}
+
+void BytecodeGenerator::generateContinueStmt(ContinueStmt& stmt) {
+    if (loopStack_.empty()) {
+        failVoid(stmt.loc, "internal error: 'continue' outside loop");
+    return;
+    }
+
+    int jumpIndex = emitJump(OpCode::Jump, stmt.loc);
+    loopStack_.back().continueJumps.push_back(jumpIndex);
 }
 
 void BytecodeGenerator::generateReturnStmt(ReturnStmt& stmt) {
-    generateExpr(*stmt.value);
+    if (stmt.value) {
+        generateExpr(*stmt.value);
+    } else {
+        emit(Instruction(OpCode::PushVoid, stmt.loc));
+    }
+
     emit(Instruction(OpCode::Ret, stmt.loc));
 }
 
@@ -166,8 +491,33 @@ void BytecodeGenerator::generatePrintStmt(PrintStmt& stmt) {
 }
 
 void BytecodeGenerator::generateExpr(Expr& expr) {
+    if (auto* e = dynamic_cast<ArrayLiteralExpr*>(&expr)) {
+        generateArrayLiteralExpr(*e);
+        return;
+    }
+
+    if (auto* e = dynamic_cast<IndexExpr*>(&expr)) {
+        generateIndexExpr(*e);
+        return;
+    }
+
+    if (auto* e = dynamic_cast<StructLiteralExpr*>(&expr)) {
+        generateStructLiteralExpr(*e);
+        return;
+    }
+
+    if (auto* e = dynamic_cast<FieldAccessExpr*>(&expr)) {
+        generateFieldAccessExpr(*e);
+        return;
+    }
+
     if (auto* e = dynamic_cast<IntLiteralExpr*>(&expr)) {
         generateIntLiteralExpr(*e);
+        return;
+    }
+
+    if (auto* e = dynamic_cast<FloatLiteralExpr*>(&expr)) {
+        generateFloatLiteralExpr(*e);
         return;
     }
 
@@ -186,6 +536,16 @@ void BytecodeGenerator::generateExpr(Expr& expr) {
         return;
     }
 
+    if (auto* e = dynamic_cast<CallExpr*>(&expr)) {
+        generateCallExpr(*e);
+        return;
+    }
+
+    if (auto* e = dynamic_cast<CastExpr*>(&expr)) {
+        generateCastExpr(*e);
+        return;
+    }
+
     if (auto* e = dynamic_cast<BinaryExpr*>(&expr)) {
         generateBinaryExpr(*e);
         return;
@@ -196,11 +556,91 @@ void BytecodeGenerator::generateExpr(Expr& expr) {
         return;
     }
 
-    throw SemanticError(expr.loc, "cannot generate bytecode for unknown expression");
+    failVoid(expr.loc, "cannot generate bytecode for unknown expression");
+    return;
+}
+
+void BytecodeGenerator::generateArrayLiteralExpr(ArrayLiteralExpr& expr) {
+    for (auto& element : expr.elements) {
+        generateExpr(*element);
+    }
+
+    emit(Instruction(
+        OpCode::MakeArray,
+        static_cast<int>(expr.elements.size()),
+        expr.loc
+    ));
+}
+
+void BytecodeGenerator::generateIndexExpr(IndexExpr& expr) {
+    if (expr.localIndex < 0) {
+        failVoid(expr.loc, "internal error: index expression has no local index");
+    return;
+    }
+
+    generateExpr(*expr.index);
+
+    emit(Instruction(OpCode::LoadIndex, expr.localIndex, expr.loc));
+}
+
+void BytecodeGenerator::generateStructLiteralExpr(StructLiteralExpr& expr) {
+    std::vector<StructLiteralField*> orderedFields;
+
+    orderedFields.reserve(expr.fields.size());
+
+    for (auto& field : expr.fields) {
+        orderedFields.push_back(&field);
+    }
+
+    std::sort(
+        orderedFields.begin(),
+        orderedFields.end(),
+        [](const StructLiteralField* left, const StructLiteralField* right) {
+            return left->fieldIndex < right->fieldIndex;
+        }
+    );
+
+    for (StructLiteralField* field : orderedFields) {
+        generateExpr(*field->value);
+    }
+
+    Instruction instruction(
+        OpCode::MakeStruct,
+        static_cast<int>(orderedFields.size()),
+        expr.loc
+    );
+
+    instruction.stringArg = expr.structName;
+
+    emit(instruction);
+}
+
+void BytecodeGenerator::generateFieldAccessExpr(FieldAccessExpr& expr) {
+    if (expr.localIndex < 0 || expr.fieldIndex < 0) {
+        failVoid(expr.loc,
+            "internal error: field access has invalid indexes");
+    return;
+    }
+
+    emit(Instruction(
+        OpCode::LoadField,
+        expr.localIndex,
+        expr.fieldIndex,
+        expr.loc
+    ));
 }
 
 void BytecodeGenerator::generateIntLiteralExpr(IntLiteralExpr& expr) {
+    if (expr.inferredType == Type::UInt) {
+        emit(Instruction(OpCode::PushUInt, expr.value, expr.loc));
+        return;
+    }
+
     emit(Instruction(OpCode::PushInt, expr.value, expr.loc));
+}
+
+void BytecodeGenerator::generateFloatLiteralExpr(FloatLiteralExpr& expr) {
+    emit(Instruction(OpCode::PushFloat, expr.value, expr.loc));
 }
 
 void BytecodeGenerator::generateBoolLiteralExpr(BoolLiteralExpr& expr) {
@@ -213,14 +653,127 @@ void BytecodeGenerator::generateStringLiteralExpr(StringLiteralExpr& expr) {
 
 void BytecodeGenerator::generateVariableExpr(VariableExpr& expr) {
     if (expr.localIndex < 0) {
-        throw SemanticError(expr.loc, "internal error: variable has no local index");
+        failVoid(expr.loc, "internal error: variable has no local index");
+    return;
     }
 
     emit(Instruction(OpCode::Load, expr.localIndex, expr.loc));
 }
 
+void BytecodeGenerator::generateCallExpr(CallExpr& expr) {
+    if (expr.callee == "toInt") {
+        generateExpr(*expr.arguments[0]);
+        emit(Instruction(OpCode::ToInt, expr.loc));
+        return;
+    }
+
+
+    if (expr.callee == "sizeof") {
+        emit(Instruction(OpCode::PushInt, metaSizeOf(*expr.arguments[0]), expr.loc));
+        return;
+    }
+
+    if (expr.callee == "typeid" || expr.callee == "typeof") {
+        emit(Instruction(OpCode::PushString, metaTypeName(*expr.arguments[0]), expr.loc));
+        return;
+    }
+
+
+    if (expr.callee == "input") {
+        emit(Instruction(OpCode::Input, expr.loc));
+        return;
+    }
+
+    if (expr.callee == "assert") {
+        generateExpr(*expr.arguments[0]);
+
+        std::string message = "assertion failed";
+
+        if (expr.arguments.size() == 2) {
+            auto* literal = dynamic_cast<StringLiteralExpr*>(expr.arguments[1].get());
+
+            if (!literal) {
+                failVoid(expr.arguments[1]->loc,
+                    "assert message must be a string literal in bytecode generator");
+    return;
+            }
+
+            message = literal->value;
+        }
+
+        emit(Instruction(OpCode::Assert, message, expr.loc));
+        return;
+    }
+
+    if (expr.callee == "len") {
+        generateExpr(*expr.arguments[0]);
+        emit(Instruction(OpCode::Len, expr.loc));
+        return;
+    }
+
+    if (expr.callee == "exit") {
+        generateExpr(*expr.arguments[0]);
+        emit(Instruction(OpCode::Exit, expr.loc));
+        return;
+    }
+
+    if (expr.callee == "panic") {
+        generateExpr(*expr.arguments[0]);
+        emit(Instruction(OpCode::Panic, expr.loc));
+        return;
+    }
+
+    if (expr.functionIndex < 0) {
+        failVoid(expr.loc, "internal error: function call has no function index");
+    return;
+    }
+
+    for (auto& argument : expr.arguments) {
+        generateExpr(*argument);
+    }
+
+    emit(Instruction(OpCode::Call, expr.functionIndex, expr.loc));
+}
+
+void BytecodeGenerator::generateCastExpr(CastExpr& expr) {
+    generateExpr(*expr.expression);
+
+    Type sourceType = expr.expression->inferredType;
+
+    if (sourceType == expr.targetType) {
+        return;
+    }
+
+    switch (expr.targetType) {
+        case Type::Int:
+            emit(Instruction(OpCode::CastInt, expr.loc));
+            return;
+
+        case Type::UInt:
+            emit(Instruction(OpCode::CastUInt, expr.loc));
+            return;
+
+        case Type::Float:
+            emit(Instruction(OpCode::CastFloat, expr.loc));
+            return;
+
+        case Type::Bool:
+            emit(Instruction(OpCode::CastBool, expr.loc));
+            return;
+
+        case Type::Generic:
+        case Type::IntArray:
+        case Type::Struct:
+        case Type::String:
+        case Type::Void:
+        case Type::Unknown:
+            failVoid(expr.loc,
+                "cannot generate cast to " + typeToString(expr.targetType));
+    return;
+    }
+}
+
 void BytecodeGenerator::generateBinaryExpr(BinaryExpr& expr) {
-    // ленивое вычисление &&
     if (expr.op == BinaryOp::And) {
         generateExpr(*expr.left);
 
@@ -241,7 +794,6 @@ void BytecodeGenerator::generateBinaryExpr(BinaryExpr& expr) {
         return;
     }
 
-    // ленивое вычисление ||
     if (expr.op == BinaryOp::Or) {
         generateExpr(*expr.left);
 
@@ -266,6 +818,27 @@ void BytecodeGenerator::generateBinaryExpr(BinaryExpr& expr) {
     generateExpr(*expr.right);
 
     switch (expr.op) {
+        case BinaryOp::BitAnd:
+            emit(Instruction(OpCode::BitAnd, expr.loc));
+            return;
+
+        case BinaryOp::BitOr:
+            emit(Instruction(OpCode::BitOr, expr.loc));
+            return;
+
+        case BinaryOp::BitXor:
+            emit(Instruction(OpCode::BitXor, expr.loc));
+            return;
+
+        case BinaryOp::ShiftLeft:
+            emit(Instruction(OpCode::ShiftLeft, expr.loc));
+            return;
+
+        case BinaryOp::ShiftRight:
+            emit(Instruction(OpCode::ShiftRight, expr.loc));
+            return;
+
+
         case BinaryOp::Add:
             emit(Instruction(OpCode::Add, expr.loc));
             return;
@@ -315,13 +888,19 @@ void BytecodeGenerator::generateBinaryExpr(BinaryExpr& expr) {
             break;
     }
 
-    throw SemanticError(expr.loc, "unknown binary operator in bytecode generator");
+    failVoid(expr.loc, "unknown binary operator in bytecode generator");
+    return;
 }
 
 void BytecodeGenerator::generateUnaryExpr(UnaryExpr& expr) {
     generateExpr(*expr.operand);
 
     switch (expr.op) {
+        case UnaryOp::BitNot:
+            emit(Instruction(OpCode::BitNot, expr.loc));
+            return;
+
+
         case UnaryOp::Negate:
             emit(Instruction(OpCode::Neg, expr.loc));
             return;
@@ -331,13 +910,35 @@ void BytecodeGenerator::generateUnaryExpr(UnaryExpr& expr) {
             return;
     }
 
-    throw SemanticError(expr.loc, "unknown unary operator in bytecode generator");
+    failVoid(expr.loc, "unknown unary operator in bytecode generator");
+    return;
 }
 
-void BytecodeGenerator::emitDefaultValue(Type type, SourceLocation location) {
+void BytecodeGenerator::emitDefaultValue(Type type, int arraySize, SourceLocation location) {
     switch (type) {
         case Type::Int:
             emit(Instruction(OpCode::PushInt, 0, location));
+            return;
+
+        case Type::UInt:
+            emit(Instruction(OpCode::PushUInt, 0, location));
+            return;
+
+        case Type::IntArray:
+            if (arraySize <= 0) {
+                failVoid(location, "invalid array size for default value");
+    return;
+            }
+
+            for (int i = 0; i < arraySize; ++i) {
+                emit(Instruction(OpCode::PushInt, 0, location));
+            }
+
+            emit(Instruction(OpCode::MakeArray, arraySize, location));
+            return;
+
+        case Type::Float:
+            emit(Instruction(OpCode::PushFloat, 0.0, location));
             return;
 
         case Type::Bool:
@@ -348,8 +949,22 @@ void BytecodeGenerator::emitDefaultValue(Type type, SourceLocation location) {
             emit(Instruction(OpCode::PushString, "", location));
             return;
 
+        case Type::Struct:
+            emit(Instruction(OpCode::PushVoid, location));
+            return;
+
+        case Type::Generic:
+            emit(Instruction(OpCode::PushVoid, location));
+            return;
+
         case Type::Void:
+            emit(Instruction(OpCode::PushVoid, location));
+            return;
+
         case Type::Unknown:
-            throw SemanticError(location, "cannot emit default value for type " + typeToString(type));
+            failVoid(location, "cannot emit default value for type " + typeToString(type));
+    return;
     }
 }
+
+} 
