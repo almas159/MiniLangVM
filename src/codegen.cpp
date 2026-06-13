@@ -838,8 +838,43 @@ void BytecodeGenerator::generateCallExpr(CallExpr& expr) {
     return;
     }
 
-    for (auto& argument : expr.arguments) {
-        generateExpr(*argument);
+    for (std::size_t i = 0; i < expr.arguments.size(); ++i) {
+        generateExpr(*expr.arguments[i]);
+
+        if (i < expr.argumentTargetTypes.size()) {
+            Type sourceType = expr.arguments[i]->inferredType;
+            Type targetType = expr.argumentTargetTypes[i];
+
+            if (sourceType != targetType) {
+                switch (targetType) {
+                    case Type::Int:
+                        emit(Instruction(OpCode::CastInt, expr.arguments[i]->loc));
+                        break;
+
+                    case Type::UInt:
+                        emit(Instruction(OpCode::CastUInt, expr.arguments[i]->loc));
+                        break;
+
+                    case Type::Float:
+                        emit(Instruction(OpCode::CastFloat, expr.arguments[i]->loc));
+                        break;
+
+                    case Type::Bool:
+                        emit(Instruction(OpCode::CastBool, expr.arguments[i]->loc));
+                        break;
+
+                    case Type::Struct:
+                    case Type::IntArray:
+                    case Type::String:
+                    case Type::Void:
+                    case Type::Generic:
+                    case Type::Unknown:
+                        failVoid(expr.arguments[i]->loc,
+                            "unsupported implicit argument conversion in bytecode generator");
+                        return;
+                }
+            }
+        }
     }
 
     emit(Instruction(OpCode::Call, expr.functionIndex, expr.loc));

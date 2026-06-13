@@ -467,6 +467,8 @@ struct CallExpr : Expr {
     std::vector<Type> typeArguments;
     std::vector<std::string> typeArgumentNames;
     std::vector<std::unique_ptr<Expr>> arguments;
+    std::vector<Type> argumentTargetTypes;
+    std::vector<std::string> argumentTargetTypeNames;
     int functionIndex = -1;
 
     CallExpr(std::string callee,

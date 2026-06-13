@@ -56,7 +56,7 @@ private:
     };
 
     std::vector<std::unordered_map<std::string, Symbol>> scopes_;
-    std::unordered_map<std::string, FunctionSymbol> functions_;
+    std::unordered_map<std::string, std::vector<FunctionSymbol>> functions_;
     std::unordered_map<std::string, StructSymbol> structs_;
 
     int nextLocalIndex_ = 0;
@@ -140,6 +140,7 @@ private:
     Type analyzeBinaryExpr(BinaryExpr& expr);
     Type analyzeUnaryExpr(UnaryExpr& expr);
 
+    bool canImplicitlyConvert(Type from, Type to) const;
     bool sameType(Type left, Type right) const;
     bool canAssign(Type target, Type source) const;
 };

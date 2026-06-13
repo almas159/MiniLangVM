@@ -135,17 +135,24 @@ void SemanticAnalyzer::analyze(Program& program) {
 
     if (mainIt == functions_.end()) {
         failVoid(program.loc, "program does not contain main function");
-    return;
+        return;
     }
 
-    if (mainIt->second.returnType != Type::Int) {
-        failVoid(mainIt->second.location, "main must return int");
-    return;
+    if (mainIt->second.size() != 1) {
+        failVoid(mainIt->second.front().location, "main function cannot be overloaded");
+        return;
     }
 
-    if (!mainIt->second.parameterTypes.empty()) {
-        failVoid(mainIt->second.location, "main must not have parameters");
-    return;
+    const FunctionSymbol& mainFunction = mainIt->second.front();
+
+    if (mainFunction.returnType != Type::Int) {
+        failVoid(mainFunction.location, "main must return int");
+        return;
+    }
+
+    if (!mainFunction.parameterTypes.empty()) {
+        failVoid(mainFunction.location, "main must not have parameters");
+        return;
     }
 
     for (auto& function : program.functions) {
@@ -231,6 +238,12 @@ void SemanticAnalyzer::collectStructDeclarations(Program& program) {
 void SemanticAnalyzer::collectFunctionDeclarations(Program& program) {
     int index = 0;
 
+    auto typeNameMatters = [](Type type) {
+        return type == Type::Struct ||
+               type == Type::Generic ||
+               type == Type::IntArray;
+    };
+
     for (auto& function : program.functions) {
         std::unordered_set<std::string> typeParameterSet;
 
@@ -262,12 +275,6 @@ void SemanticAnalyzer::collectFunctionDeclarations(Program& program) {
             return;
         }
 
-        if (functions_.find(function->name) != functions_.end()) {
-            failVoid(function->loc,
-                "function '" + function->name + "' is already declared");
-            return;
-        }
-
         FunctionSymbol symbol;
         symbol.returnType = function->returnType;
         symbol.returnTypeName = function->returnTypeName;
@@ -293,8 +300,38 @@ void SemanticAnalyzer::collectFunctionDeclarations(Program& program) {
             symbol.parameterTypeNames.push_back(parameter.typeName);
         }
 
+        auto& overloads = functions_[function->name];
+
+        for (const FunctionSymbol& existing : overloads) {
+            if (existing.parameterTypes.size() != symbol.parameterTypes.size()) {
+                continue;
+            }
+
+            bool sameSignature = true;
+
+            for (std::size_t i = 0; i < symbol.parameterTypes.size(); ++i) {
+                if (existing.parameterTypes[i] != symbol.parameterTypes[i]) {
+                    sameSignature = false;
+                    break;
+                }
+
+                if (typeNameMatters(symbol.parameterTypes[i]) &&
+                    existing.parameterTypeNames[i] != symbol.parameterTypeNames[i]) {
+                    sameSignature = false;
+                    break;
+                }
+            }
+
+            if (sameSignature) {
+                failVoid(function->loc,
+                    "function '" + function->name +
+                    "' with the same parameter types is already declared");
+                return;
+            }
+        }
+
         function->functionIndex = index;
-        functions_[function->name] = symbol;
+        overloads.push_back(symbol);
 
         index++;
     }
@@ -1663,7 +1700,7 @@ Type SemanticAnalyzer::analyzeCallExpr(CallExpr& expr) {
         if (argumentType != Type::String &&
             argumentType != Type::IntArray) {
             return fail<Type>(expr.arguments[0]->loc,
-                "len argument must be string or int32[], got " +
+                "len argument must be string or array, got " +
                 typeToString(argumentType));
         }
 
@@ -1713,14 +1750,23 @@ Type SemanticAnalyzer::analyzeCallExpr(CallExpr& expr) {
             "function '" + expr.callee + "' is not declared");
     }
 
-    FunctionSymbol& function = found->second;
+    std::vector<Type> argumentTypes;
+    std::vector<std::string> argumentTypeNames;
 
-    if (expr.arguments.size() != function.parameterTypes.size()) {
-        return fail<Type>(expr.loc,
-            "function '" + expr.callee + "' expects " +
-            std::to_string(function.parameterTypes.size()) +
-            " arguments, got " +
-            std::to_string(expr.arguments.size()));
+    argumentTypes.reserve(expr.arguments.size());
+    argumentTypeNames.reserve(expr.arguments.size());
+
+    for (auto& argument : expr.arguments) {
+        Type argumentType = analyzeExpr(*argument);
+        argumentTypes.push_back(argumentType);
+
+        if (argumentType == Type::Struct ||
+            argumentType == Type::Generic ||
+            argumentType == Type::IntArray) {
+            argumentTypeNames.push_back(argument->inferredStructName);
+        } else {
+            argumentTypeNames.push_back("");
+        }
     }
 
     struct GenericBinding {
@@ -1728,126 +1774,188 @@ Type SemanticAnalyzer::analyzeCallExpr(CallExpr& expr) {
         std::string typeName;
     };
 
-    std::unordered_map<std::string, GenericBinding> genericBindings;
+    struct CandidateMatch {
+        FunctionSymbol* function = nullptr;
+        std::unordered_map<std::string, GenericBinding> genericBindings;
+        std::vector<Type> targetTypes;
+        std::vector<std::string> targetTypeNames;
+        Type returnType = Type::Unknown;
+        std::string returnTypeName;
+        int score = 0;
+    };
 
-    if (!expr.typeArguments.empty()) {
-        if (function.typeParameters.empty()) {
-            return fail<Type>(
-                expr.loc,
-                "function '" + expr.callee + "' is not generic"
-            );
-        }
+    auto typeNameMatters = [](Type type) {
+        return type == Type::Struct ||
+               type == Type::Generic ||
+               type == Type::IntArray;
+    };
 
-        if (expr.typeArguments.size() != function.typeParameters.size()) {
-            return fail<Type>(
-                expr.loc,
-                "function '" + expr.callee + "' expects " +
-                std::to_string(function.typeParameters.size()) +
-                " generic type arguments, got " +
-                std::to_string(expr.typeArguments.size())
-            );
-        }
-
-        for (std::size_t i = 0; i < expr.typeArguments.size(); ++i) {
-            Type explicitType = expr.typeArguments[i];
-            std::string explicitTypeName = expr.typeArgumentNames[i];
-
-            if (explicitType == Type::Void ||
-                explicitType == Type::Unknown ||
-                explicitType == Type::Generic) {
-                return fail<Type>(
-                    expr.loc,
-                    "invalid generic type argument"
-                );
+    auto sameConcreteType =
+        [&](Type leftType, const std::string& leftName,
+            Type rightType, const std::string& rightName) {
+            if (!sameType(leftType, rightType)) {
+                return false;
             }
 
-            genericBindings[function.typeParameters[i]] =
-                GenericBinding{explicitType, explicitTypeName};
-        }
-    }
-
-    for (std::size_t i = 0; i < expr.arguments.size(); ++i) {
-        Type argumentType = analyzeExpr(*expr.arguments[i]);
-        Type parameterType = function.parameterTypes[i];
-
-        if (parameterType == Type::Generic) {
-            const std::string& genericName = function.parameterTypeNames[i];
-
-            auto existing = genericBindings.find(genericName);
-
-            std::string argumentTypeName;
-
-            if (argumentType == Type::Struct || argumentType == Type::Generic) {
-                argumentTypeName = expr.arguments[i]->inferredStructName;
+            if (typeNameMatters(leftType) || typeNameMatters(rightType)) {
+                return leftName == rightName;
             }
 
-            if (existing == genericBindings.end()) {
-                genericBindings[genericName] = GenericBinding{argumentType, argumentTypeName};
+            return true;
+        };
+
+    auto tryCandidate =
+        [&](FunctionSymbol& function, bool allowImplicit)
+            -> std::optional<CandidateMatch> {
+            if (expr.arguments.size() != function.parameterTypes.size()) {
+                return std::nullopt;
+            }
+
+            CandidateMatch match;
+            match.function = &function;
+            match.score = function.typeParameters.empty() ? 0 : 1;
+
+            if (!expr.typeArguments.empty()) {
+                if (function.typeParameters.empty()) {
+                    return std::nullopt;
+                }
+
+                if (expr.typeArguments.size() != function.typeParameters.size()) {
+                    return std::nullopt;
+                }
+
+                for (std::size_t i = 0; i < expr.typeArguments.size(); ++i) {
+                    Type explicitType = expr.typeArguments[i];
+                    std::string explicitTypeName = expr.typeArgumentNames[i];
+
+                    if (explicitType == Type::Void ||
+                        explicitType == Type::Unknown ||
+                        explicitType == Type::Generic) {
+                        return std::nullopt;
+                    }
+
+                    match.genericBindings[function.typeParameters[i]] =
+                        GenericBinding{explicitType, explicitTypeName};
+                }
+            }
+
+            match.targetTypes.resize(argumentTypes.size(), Type::Unknown);
+            match.targetTypeNames.resize(argumentTypes.size());
+
+            for (std::size_t i = 0; i < argumentTypes.size(); ++i) {
+                Type argumentType = argumentTypes[i];
+                const std::string& argumentTypeName = argumentTypeNames[i];
+
+                Type parameterType = function.parameterTypes[i];
+                std::string parameterTypeName = function.parameterTypeNames[i];
+
+                if (parameterType == Type::Generic) {
+                    const std::string& genericName = parameterTypeName;
+
+                    auto existing = match.genericBindings.find(genericName);
+
+                    if (existing == match.genericBindings.end()) {
+                        match.genericBindings[genericName] =
+                            GenericBinding{argumentType, argumentTypeName};
+
+                        parameterType = argumentType;
+                        parameterTypeName = argumentTypeName;
+                    } else {
+                        parameterType = existing->second.type;
+                        parameterTypeName = existing->second.typeName;
+                    }
+                }
+
+                if (sameConcreteType(parameterType,
+                                     parameterTypeName,
+                                     argumentType,
+                                     argumentTypeName)) {
+                    match.targetTypes[i] = parameterType;
+                    match.targetTypeNames[i] = parameterTypeName;
+                    continue;
+                }
+
+                if (allowImplicit &&
+                    !typeNameMatters(parameterType) &&
+                    canImplicitlyConvert(argumentType, parameterType)) {
+                    match.targetTypes[i] = parameterType;
+                    match.targetTypeNames[i] = parameterTypeName;
+                    match.score += 10;
+                    continue;
+                }
+
+                return std::nullopt;
+            }
+
+            if (function.returnType == Type::Generic) {
+                auto binding = match.genericBindings.find(function.returnTypeName);
+
+                if (binding == match.genericBindings.end()) {
+                    return std::nullopt;
+                }
+
+                match.returnType = binding->second.type;
+                match.returnTypeName = binding->second.typeName;
             } else {
-                bool sameBinding = existing->second.type == argumentType;
-
-                if ((argumentType == Type::Struct || argumentType == Type::Generic) &&
-                    existing->second.typeName != argumentTypeName) {
-                    sameBinding = false;
-                }
-
-                if (!sameBinding) {
-                    return fail<Type>(expr.arguments[i]->loc,
-                        "generic type '" + genericName +
-                        "' has inconsistent argument types in call to '" +
-                        expr.callee + "'");
-                }
+                match.returnType = function.returnType;
+                match.returnTypeName = function.returnTypeName;
             }
 
-            continue;
-        }
+            return match;
+        };
 
-        if (parameterType == Type::Struct) {
-            if (argumentType != Type::Struct ||
-                expr.arguments[i]->inferredStructName != function.parameterTypeNames[i]) {
-                return fail<Type>(expr.arguments[i]->loc,
-                    "argument " + std::to_string(i + 1) +
-                    " of function '" + expr.callee + "' must be struct '" +
-                    function.parameterTypeNames[i] + "'");
+    std::optional<CandidateMatch> best;
+    bool ambiguous = false;
+
+    auto chooseCandidate = [&](bool allowImplicit) {
+        best.reset();
+        ambiguous = false;
+
+        for (FunctionSymbol& function : found->second) {
+            auto current = tryCandidate(function, allowImplicit);
+
+            if (!current) {
+                continue;
             }
 
-            continue;
-        }
+            if (!best || current->score < best->score) {
+                best = current;
+                ambiguous = false;
+                continue;
+            }
 
-        if (!(sameType(parameterType, argumentType) ||
-              (parameterType == Type::UInt && argumentType == Type::Int))) {
-            return fail<Type>(expr.arguments[i]->loc,
-                "argument " + std::to_string(i + 1) +
-                " of function '" + expr.callee + "' must be " +
-                typeToString(parameterType) + ", got " +
-                typeToString(argumentType));
+            if (current->score == best->score) {
+                ambiguous = true;
+            }
         }
+    };
+
+    chooseCandidate(false);
+
+    if (!best) {
+        chooseCandidate(true);
     }
 
-    expr.functionIndex = function.functionIndex;
-
-    if (function.returnType == Type::Generic) {
-        auto binding = genericBindings.find(function.returnTypeName);
-
-        if (binding == genericBindings.end()) {
-            return fail<Type>(expr.loc,
-                "cannot infer generic return type '" +
-                function.returnTypeName + "' in call to '" + expr.callee + "'");
-        }
-
-        expr.inferredType = binding->second.type;
-
-        if (expr.inferredType == Type::Struct || expr.inferredType == Type::Generic) {
-            expr.inferredStructName = binding->second.typeName;
-        }
-
-        return expr.inferredType;
+    if (!best) {
+        return fail<Type>(expr.loc,
+            "no matching overload for function '" + expr.callee + "'");
     }
 
-    expr.inferredType = function.returnType;
+    if (ambiguous) {
+        return fail<Type>(expr.loc,
+            "ambiguous overload call to function '" + expr.callee + "'");
+    }
 
-    if (function.returnType == Type::Struct) {
-        expr.inferredStructName = function.returnTypeName;
+    expr.functionIndex = best->function->functionIndex;
+    expr.argumentTargetTypes = best->targetTypes;
+    expr.argumentTargetTypeNames = best->targetTypeNames;
+
+    expr.inferredType = best->returnType;
+
+    if (expr.inferredType == Type::Struct ||
+        expr.inferredType == Type::Generic ||
+        expr.inferredType == Type::IntArray) {
+        expr.inferredStructName = best->returnTypeName;
     }
 
     return expr.inferredType;
@@ -2120,6 +2228,22 @@ Type SemanticAnalyzer::analyzeUnaryExpr(UnaryExpr& expr) {
     }
 
     return fail<Type>(expr.loc, "unknown unary operator");
+}
+
+bool SemanticAnalyzer::canImplicitlyConvert(Type from, Type to) const {
+    if (from == to) {
+        return true;
+    }
+
+    // A.3.1: implicit conversions used only during overload resolution.
+    // The safe numeric widening supported here:
+    //   int  -> float64
+    //   uint -> float64
+    if ((from == Type::Int || from == Type::UInt) && to == Type::Float) {
+        return true;
+    }
+
+    return false;
 }
 
 bool SemanticAnalyzer::sameType(Type left, Type right) const {
