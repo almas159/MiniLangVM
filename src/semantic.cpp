@@ -7,6 +7,100 @@
 
 namespace minilang {
 
+static Type arrayElementTypeFromEncodedName(const std::string& encoded) {
+    if (encoded.empty()) {
+        return Type::Int;
+    }
+
+    if (encoded == "__array:int:") {
+        return Type::Int;
+    }
+
+    if (encoded == "__array:uint:") {
+        return Type::UInt;
+    }
+
+    if (encoded == "__array:float64:") {
+        return Type::Float;
+    }
+
+    if (encoded == "__array:bool:") {
+        return Type::Bool;
+    }
+
+    if (encoded == "__array:string:") {
+        return Type::String;
+    }
+
+    if (encoded.rfind("__array:struct:", 0) == 0) {
+        return Type::Struct;
+    }
+
+    return Type::Unknown;
+}
+
+static std::string arrayElementStructNameFromEncodedName(const std::string& encoded) {
+    const std::string prefix = "__array:struct:";
+
+    if (encoded.rfind(prefix, 0) == 0) {
+        return encoded.substr(prefix.size());
+    }
+
+    return "";
+}
+
+static std::string encodeArrayElementTypeNameSemantic(Type type, const std::string& typeName) {
+    switch (type) {
+        case Type::Int:
+            return "__array:int:";
+
+        case Type::UInt:
+            return "__array:uint:";
+
+        case Type::Float:
+            return "__array:float64:";
+
+        case Type::Bool:
+            return "__array:bool:";
+
+        case Type::String:
+            return "__array:string:";
+
+        case Type::Struct:
+            return "__array:struct:" + typeName;
+
+        default:
+            return "__array:unknown:";
+    }
+}
+
+static std::string arrayElementTypeToString(const std::string& encoded) {
+    Type type = arrayElementTypeFromEncodedName(encoded);
+
+    if (type == Type::Struct) {
+        return arrayElementStructNameFromEncodedName(encoded);
+    }
+
+    return typeToString(type);
+}
+
+static bool sameConcreteType(Type expectedType,
+                             const std::string& expectedName,
+                             Type actualType,
+                             const std::string& actualName) {
+    if (expectedType != actualType) {
+        return false;
+    }
+
+    if (expectedType == Type::Struct || expectedType == Type::Generic ||
+        expectedType == Type::IntArray) {
+        return expectedName == actualName;
+    }
+
+    return true;
+}
+
+
 void SemanticAnalyzer::setDiagnostic(SourceLocation location, const std::string& message) {
     if (diagnostic_) {
         return;
@@ -80,9 +174,27 @@ void SemanticAnalyzer::collectStructDeclarations(Program& program) {
             }
 
             if (field.type == Type::IntArray) {
-                failVoid(field.loc,
-                    "array fields in structs are not supported yet");
-    return;
+                if (field.arraySize <= 0) {
+                    failVoid(field.loc, "array field size must be positive");
+                    return;
+                }
+
+                Type elementType = arrayElementTypeFromEncodedName(field.typeName);
+                std::string elementStructName =
+                    arrayElementStructNameFromEncodedName(field.typeName);
+
+                if (elementType == Type::Unknown) {
+                    failVoid(field.loc, "unknown array field element type");
+                    return;
+                }
+
+                if (elementType == Type::Struct &&
+                    structs_.find(elementStructName) == structs_.end() &&
+                    elementStructName != structDecl->name) {
+                    failVoid(field.loc,
+                        "unknown struct type '" + elementStructName + "'");
+                    return;
+                }
             }
 
             if (field.type == Type::Struct &&
@@ -107,6 +219,7 @@ void SemanticAnalyzer::collectStructDeclarations(Program& program) {
             fieldSymbol.typeName = field.typeName;
             fieldSymbol.name = field.name;
             fieldSymbol.location = field.loc;
+            fieldSymbol.arraySize = field.arraySize;
 
             symbol.fields.push_back(fieldSymbol);
         }
@@ -420,32 +533,85 @@ void SemanticAnalyzer::analyzeVarDeclStmt(VarDeclStmt& stmt) {
     if (stmt.type == Type::IntArray) {
         if (stmt.arraySize <= 0) {
             failVoid(stmt.loc, "array size must be positive");
-    return;
+            return;
         }
 
-        if (stmt.initializer) {
-            Type initializerType = analyzeExpr(*stmt.initializer);
+        Type expectedElementType = arrayElementTypeFromEncodedName(stmt.structName);
+        std::string expectedElementName = arrayElementStructNameFromEncodedName(stmt.structName);
 
-            if (initializerType != Type::IntArray) {
-                failVoid(stmt.initializer->loc,
-                    "cannot initialize int32[] variable '" + stmt.name +
-                    "' with " + typeToString(initializerType) + " value");
-    return;
+        if (expectedElementType == Type::Unknown) {
+            failVoid(stmt.loc, "unknown array element type");
+            return;
+        }
+
+        if (!stmt.initializer) {
+            if (expectedElementType != Type::Int) {
+                failVoid(stmt.loc,
+                    "array variable '" + stmt.name +
+                    "' requires initializer for element type " +
+                    arrayElementTypeToString(stmt.structName));
+                return;
             }
 
-            if (stmt.initializer->inferredArraySize != stmt.arraySize) {
-                failVoid(stmt.initializer->loc,
-                    "array initializer size mismatch for '" + stmt.name +
-                    "': expected " + std::to_string(stmt.arraySize) +
-                    ", got " + std::to_string(stmt.initializer->inferredArraySize));
-    return;
+            int localIndex = nextLocalIndex_++;
+            stmt.localIndex = localIndex;
+            declareVariable(stmt.name, stmt.type, localIndex, stmt.loc,
+                            stmt.arraySize, stmt.structName, stmt.isMutable);
+            return;
+        }
+
+        auto* arrayLiteral = dynamic_cast<ArrayLiteralExpr*>(stmt.initializer.get());
+
+        if (!arrayLiteral) {
+            failVoid(stmt.initializer->loc,
+                "array variable '" + stmt.name + "' requires array literal initializer");
+            return;
+        }
+
+        if (static_cast<int>(arrayLiteral->elements.size()) != stmt.arraySize) {
+            failVoid(stmt.initializer->loc,
+                "array initializer size mismatch for '" + stmt.name +
+                "': expected " + std::to_string(stmt.arraySize) +
+                ", got " + std::to_string(arrayLiteral->elements.size()));
+            return;
+        }
+
+        for (auto& element : arrayLiteral->elements) {
+            Type actualType = analyzeExpr(*element);
+            std::string actualName;
+
+            if (actualType == Type::Struct || actualType == Type::Generic) {
+                actualName = element->inferredStructName;
+            }
+
+            if (expectedElementType == Type::UInt && actualType == Type::Int) {
+                auto* literal = dynamic_cast<IntLiteralExpr*>(element.get());
+
+                if (literal && literal->value >= 0) {
+                    element->inferredType = Type::UInt;
+                    actualType = Type::UInt;
+                }
+            }
+
+            if (!sameConcreteType(expectedElementType, expectedElementName,
+                                  actualType, actualName)) {
+                failVoid(element->loc,
+                    "array element must be " +
+                    arrayElementTypeToString(stmt.structName) +
+                    ", got " + typeToString(actualType));
+                return;
             }
         }
+
+        arrayLiteral->inferredType = Type::IntArray;
+        arrayLiteral->inferredArraySize = stmt.arraySize;
+        arrayLiteral->inferredStructName = stmt.structName;
 
         int localIndex = nextLocalIndex_++;
         stmt.localIndex = localIndex;
 
-        declareVariable(stmt.name, stmt.type, localIndex, stmt.loc, stmt.arraySize, stmt.structName, stmt.isMutable);
+        declareVariable(stmt.name, stmt.type, localIndex, stmt.loc,
+                        stmt.arraySize, stmt.structName, stmt.isMutable);
         return;
     }
 
@@ -468,6 +634,7 @@ void SemanticAnalyzer::analyzeVarDeclStmt(VarDeclStmt& stmt) {
 
         if (initializerType == Type::IntArray) {
             stmt.arraySize = stmt.initializer->inferredArraySize;
+            stmt.structName = stmt.initializer->inferredStructName;
         }
 
         if (initializerType == Type::Struct) {
@@ -556,24 +723,59 @@ void SemanticAnalyzer::analyzeAssignStmt(AssignStmt& stmt) {
 }
 
 void SemanticAnalyzer::analyzeArrayAssignStmt(ArrayAssignStmt& stmt) {
-    Symbol* symbol = findVariable(stmt.name);
+    Type expectedElementType = Type::Unknown;
+    std::string expectedElementName;
+    std::string encodedElementType;
 
-    if (!symbol) {
-        failVoid(stmt.loc,
-            "array '" + stmt.name + "' is not declared");
-    return;
-    }
+    if (stmt.arrayExpr) {
+        if (auto* fieldAccess = dynamic_cast<FieldAccessExpr*>(stmt.arrayExpr.get())) {
+            Symbol* owner = findVariable(fieldAccess->objectName);
 
-    if (!symbol->isMutable) {
-        failVoid(stmt.loc,
-            "cannot modify immutable array '" + stmt.name + "'");
-    return;
-    }
+            if (!owner) {
+                failVoid(stmt.loc,
+                    "variable '" + fieldAccess->objectName + "' is not declared");
+                return;
+            }
 
-    if (symbol->type != Type::IntArray) {
-        failVoid(stmt.loc,
-            "variable '" + stmt.name + "' is not an array");
-    return;
+            if (!owner->isMutable) {
+                failVoid(stmt.loc,
+                    "cannot modify immutable struct '" + fieldAccess->objectName + "'");
+                return;
+            }
+        }
+
+        Type arrayType = analyzeExpr(*stmt.arrayExpr);
+
+        if (arrayType != Type::IntArray) {
+            failVoid(stmt.arrayExpr->loc,
+                "index assignment target must be array, got " + typeToString(arrayType));
+            return;
+        }
+
+        encodedElementType = stmt.arrayExpr->inferredStructName;
+    } else {
+        Symbol* symbol = findVariable(stmt.name);
+
+        if (!symbol) {
+            failVoid(stmt.loc,
+                "array '" + stmt.name + "' is not declared");
+            return;
+        }
+
+        if (!symbol->isMutable) {
+            failVoid(stmt.loc,
+                "cannot modify immutable array '" + stmt.name + "'");
+            return;
+        }
+
+        if (symbol->type != Type::IntArray) {
+            failVoid(stmt.loc,
+                "variable '" + stmt.name + "' is not an array");
+            return;
+        }
+
+        stmt.localIndex = symbol->localIndex;
+        encodedElementType = symbol->structName;
     }
 
     Type indexType = analyzeExpr(*stmt.index);
@@ -581,18 +783,36 @@ void SemanticAnalyzer::analyzeArrayAssignStmt(ArrayAssignStmt& stmt) {
     if (indexType != Type::Int) {
         failVoid(stmt.index->loc,
             "array index must be int, got " + typeToString(indexType));
-    return;
+        return;
     }
+
+    expectedElementType = arrayElementTypeFromEncodedName(encodedElementType);
+    expectedElementName = arrayElementStructNameFromEncodedName(encodedElementType);
 
     Type valueType = analyzeExpr(*stmt.value);
+    std::string valueName;
 
-    if (valueType != Type::Int) {
-        failVoid(stmt.value->loc,
-            "int32[] element must be int, got " + typeToString(valueType));
-    return;
+    if (valueType == Type::Struct || valueType == Type::Generic) {
+        valueName = stmt.value->inferredStructName;
     }
 
-    stmt.localIndex = symbol->localIndex;
+    if (expectedElementType == Type::UInt && valueType == Type::Int) {
+        auto* literal = dynamic_cast<IntLiteralExpr*>(stmt.value.get());
+
+        if (literal && literal->value >= 0) {
+            stmt.value->inferredType = Type::UInt;
+            valueType = Type::UInt;
+        }
+    }
+
+    if (!sameConcreteType(expectedElementType, expectedElementName,
+                          valueType, valueName)) {
+        failVoid(stmt.value->loc,
+            "array element must be " +
+            arrayElementTypeToString(encodedElementType) +
+            ", got " + typeToString(valueType));
+        return;
+    }
 }
 
 void SemanticAnalyzer::analyzeFieldAssignStmt(FieldAssignStmt& stmt) {
@@ -601,19 +821,19 @@ void SemanticAnalyzer::analyzeFieldAssignStmt(FieldAssignStmt& stmt) {
     if (!symbol) {
         failVoid(stmt.loc,
             "variable '" + stmt.objectName + "' is not declared");
-    return;
+        return;
     }
 
     if (!symbol->isMutable) {
         failVoid(stmt.loc,
             "cannot modify immutable struct '" + stmt.objectName + "'");
-    return;
+        return;
     }
 
     if (symbol->type != Type::Struct) {
         failVoid(stmt.loc,
             "variable '" + stmt.objectName + "' is not a struct");
-    return;
+        return;
     }
 
     auto structIt = structs_.find(symbol->structName);
@@ -621,7 +841,7 @@ void SemanticAnalyzer::analyzeFieldAssignStmt(FieldAssignStmt& stmt) {
     if (structIt == structs_.end()) {
         failVoid(stmt.loc,
             "unknown struct type '" + symbol->structName + "'");
-    return;
+        return;
     }
 
     const StructSymbol& structSymbol = structIt->second;
@@ -641,7 +861,90 @@ void SemanticAnalyzer::analyzeFieldAssignStmt(FieldAssignStmt& stmt) {
         failVoid(stmt.loc,
             "struct '" + symbol->structName +
             "' has no field '" + stmt.fieldName + "'");
-    return;
+        return;
+    }
+
+    if (fieldSymbol->type == Type::IntArray) {
+        auto* arrayLiteral = dynamic_cast<ArrayLiteralExpr*>(stmt.value.get());
+
+        if (arrayLiteral) {
+            if (static_cast<int>(arrayLiteral->elements.size()) != fieldSymbol->arraySize) {
+                failVoid(stmt.value->loc,
+                    "field '" + stmt.fieldName +
+                    "' array size mismatch: expected " +
+                    std::to_string(fieldSymbol->arraySize) +
+                    ", got " +
+                    std::to_string(arrayLiteral->elements.size()));
+                return;
+            }
+
+            Type expectedElementType =
+                arrayElementTypeFromEncodedName(fieldSymbol->typeName);
+            std::string expectedElementName =
+                arrayElementStructNameFromEncodedName(fieldSymbol->typeName);
+
+            for (auto& element : arrayLiteral->elements) {
+                Type actualType = analyzeExpr(*element);
+                std::string actualName;
+
+                if (actualType == Type::Struct || actualType == Type::Generic) {
+                    actualName = element->inferredStructName;
+                }
+
+                if (expectedElementType == Type::UInt && actualType == Type::Int) {
+                    auto* literal = dynamic_cast<IntLiteralExpr*>(element.get());
+
+                    if (literal && literal->value >= 0) {
+                        element->inferredType = Type::UInt;
+                        actualType = Type::UInt;
+                    }
+                }
+
+                if (!sameConcreteType(expectedElementType, expectedElementName,
+                                      actualType, actualName)) {
+                    failVoid(element->loc,
+                        "field '" + stmt.fieldName +
+                        "' array element must be " +
+                        arrayElementTypeToString(fieldSymbol->typeName) +
+                        ", got " + typeToString(actualType));
+                    return;
+                }
+            }
+
+            arrayLiteral->inferredType = Type::IntArray;
+            arrayLiteral->inferredArraySize = fieldSymbol->arraySize;
+            arrayLiteral->inferredStructName = fieldSymbol->typeName;
+        } else {
+            Type valueType = analyzeExpr(*stmt.value);
+
+            if (valueType != Type::IntArray) {
+                failVoid(stmt.value->loc,
+                    "field '" + stmt.fieldName +
+                    "' must be array, got " + typeToString(valueType));
+                return;
+            }
+
+            if (stmt.value->inferredArraySize != fieldSymbol->arraySize) {
+                failVoid(stmt.value->loc,
+                    "field '" + stmt.fieldName +
+                    "' array size mismatch: expected " +
+                    std::to_string(fieldSymbol->arraySize) +
+                    ", got " +
+                    std::to_string(stmt.value->inferredArraySize));
+                return;
+            }
+
+            if (stmt.value->inferredStructName != fieldSymbol->typeName) {
+                failVoid(stmt.value->loc,
+                    "field '" + stmt.fieldName +
+                    "' array element type mismatch");
+                return;
+            }
+        }
+
+        stmt.localIndex = symbol->localIndex;
+        stmt.fieldIndex = fieldIndex;
+        return;
     }
 
     Type valueType = analyzeExpr(*stmt.value);
@@ -652,14 +955,14 @@ void SemanticAnalyzer::analyzeFieldAssignStmt(FieldAssignStmt& stmt) {
             failVoid(stmt.value->loc,
                 "field '" + stmt.fieldName +
                 "' must be struct '" + fieldSymbol->typeName + "'");
-    return;
+            return;
         }
     } else if (valueType != fieldSymbol->type) {
         failVoid(stmt.value->loc,
             "field '" + stmt.fieldName + "' must be " +
             typeToString(fieldSymbol->type) + ", got " +
             typeToString(valueType));
-    return;
+        return;
     }
 
     stmt.localIndex = symbol->localIndex;
@@ -916,32 +1219,70 @@ Type SemanticAnalyzer::analyzeArrayLiteralExpr(ArrayLiteralExpr& expr) {
         return fail<Type>(expr.loc, "empty array literal cannot infer element type");
     }
 
-    for (auto& element : expr.elements) {
-        Type elementType = analyzeExpr(*element);
+    Type firstType = analyzeExpr(*expr.elements[0]);
+    std::string firstName;
 
-        if (elementType != Type::Int) {
-            return fail<Type>(element->loc,
-                "int32[] literal element must be int, got " + typeToString(elementType));
+    if (firstType == Type::Struct || firstType == Type::Generic) {
+        firstName = expr.elements[0]->inferredStructName;
+    }
+
+    if (firstType == Type::Void || firstType == Type::Unknown ||
+        firstType == Type::IntArray) {
+        return fail<Type>(expr.elements[0]->loc,
+            "invalid array element type " + typeToString(firstType));
+    }
+
+    for (std::size_t i = 1; i < expr.elements.size(); ++i) {
+        Type elementType = analyzeExpr(*expr.elements[i]);
+        std::string elementName;
+
+        if (elementType == Type::Struct || elementType == Type::Generic) {
+            elementName = expr.elements[i]->inferredStructName;
+        }
+
+        if (!sameConcreteType(firstType, firstName, elementType, elementName)) {
+            return fail<Type>(expr.elements[i]->loc,
+                "array literal has mixed element types: expected " +
+                typeToString(firstType) + ", got " + typeToString(elementType));
         }
     }
 
     expr.inferredType = Type::IntArray;
     expr.inferredArraySize = static_cast<int>(expr.elements.size());
+    expr.inferredStructName = encodeArrayElementTypeNameSemantic(firstType, firstName);
 
     return expr.inferredType;
 }
 
 Type SemanticAnalyzer::analyzeIndexExpr(IndexExpr& expr) {
-    Symbol* symbol = findVariable(expr.arrayName);
+    std::string encodedElementType;
 
-    if (!symbol) {
-        return fail<Type>(expr.loc,
-            "array '" + expr.arrayName + "' is not declared");
-    }
+    if (expr.arrayExpr) {
+        Type arrayType = analyzeExpr(*expr.arrayExpr);
 
-    if (symbol->type != Type::IntArray) {
-        return fail<Type>(expr.loc,
-            "variable '" + expr.arrayName + "' is not an array");
+        if (arrayType != Type::IntArray) {
+            return fail<Type>(expr.arrayExpr->loc,
+                "indexing target must be array, got " + typeToString(arrayType));
+        }
+
+        encodedElementType = expr.arrayExpr->inferredStructName;
+        expr.inferredArraySize = expr.arrayExpr->inferredArraySize;
+    } else {
+        Symbol* symbol = findVariable(expr.arrayName);
+
+        if (!symbol) {
+            return fail<Type>(expr.loc,
+                "array '" + expr.arrayName + "' is not declared");
+        }
+
+        if (symbol->type != Type::IntArray) {
+            return fail<Type>(expr.loc,
+                "variable '" + expr.arrayName + "' is not an array");
+        }
+
+        expr.localIndex = symbol->localIndex;
+        expr.inferredArraySize = symbol->arraySize;
+        encodedElementType = symbol->structName;
     }
 
     Type indexType = analyzeExpr(*expr.index);
@@ -951,8 +1292,18 @@ Type SemanticAnalyzer::analyzeIndexExpr(IndexExpr& expr) {
             "array index must be int, got " + typeToString(indexType));
     }
 
-    expr.localIndex = symbol->localIndex;
-    expr.inferredType = Type::Int;
+    Type elementType = arrayElementTypeFromEncodedName(encodedElementType);
+
+    if (elementType == Type::Unknown) {
+        return fail<Type>(expr.loc, "unknown array element type");
+    }
+
+    expr.inferredType = elementType;
+
+    if (elementType == Type::Struct) {
+        expr.inferredStructName =
+            arrayElementStructNameFromEncodedName(encodedElementType);
+    }
 
     return expr.inferredType;
 }
@@ -1002,6 +1353,83 @@ Type SemanticAnalyzer::analyzeStructLiteralExpr(StructLiteralExpr& expr) {
         literalField.fieldIndex = fieldIndex;
 
         const StructFieldSymbol& expectedField = structSymbol.fields[fieldIndex];
+
+        if (expectedField.type == Type::IntArray) {
+            auto* arrayLiteral =
+                dynamic_cast<ArrayLiteralExpr*>(literalField.value.get());
+
+            if (!arrayLiteral) {
+                Type valueType = analyzeExpr(*literalField.value);
+
+                if (valueType != Type::IntArray) {
+                    return fail<Type>(literalField.value->loc,
+                        "field '" + literalField.name +
+                        "' must be array, got " + typeToString(valueType));
+                }
+
+                if (literalField.value->inferredArraySize != expectedField.arraySize) {
+                    return fail<Type>(literalField.value->loc,
+                        "field '" + literalField.name +
+                        "' array size mismatch: expected " +
+                        std::to_string(expectedField.arraySize) +
+                        ", got " +
+                        std::to_string(literalField.value->inferredArraySize));
+                }
+
+                if (literalField.value->inferredStructName != expectedField.typeName) {
+                    return fail<Type>(literalField.value->loc,
+                        "field '" + literalField.name +
+                        "' array element type mismatch");
+                }
+
+                continue;
+            }
+
+            if (static_cast<int>(arrayLiteral->elements.size()) != expectedField.arraySize) {
+                return fail<Type>(literalField.value->loc,
+                    "field '" + literalField.name +
+                    "' array size mismatch: expected " +
+                    std::to_string(expectedField.arraySize) +
+                    ", got " + std::to_string(arrayLiteral->elements.size()));
+            }
+
+            Type expectedElementType =
+                arrayElementTypeFromEncodedName(expectedField.typeName);
+            std::string expectedElementName =
+                arrayElementStructNameFromEncodedName(expectedField.typeName);
+
+            for (auto& element : arrayLiteral->elements) {
+                Type actualType = analyzeExpr(*element);
+                std::string actualName;
+
+                if (actualType == Type::Struct || actualType == Type::Generic) {
+                    actualName = element->inferredStructName;
+                }
+
+                if (expectedElementType == Type::UInt && actualType == Type::Int) {
+                    auto* literal = dynamic_cast<IntLiteralExpr*>(element.get());
+
+                    if (literal && literal->value >= 0) {
+                        element->inferredType = Type::UInt;
+                        actualType = Type::UInt;
+                    }
+                }
+
+                if (!sameConcreteType(expectedElementType, expectedElementName,
+                                      actualType, actualName)) {
+                    return fail<Type>(element->loc,
+                        "field '" + literalField.name +
+                        "' array element must be " +
+                        arrayElementTypeToString(expectedField.typeName) +
+                        ", got " + typeToString(actualType));
+                }
+            }
+
+            arrayLiteral->inferredType = Type::IntArray;
+            arrayLiteral->inferredArraySize = expectedField.arraySize;
+            arrayLiteral->inferredStructName = expectedField.typeName;
+            continue;
+        }
 
         Type valueType = analyzeExpr(*literalField.value);
 
@@ -1064,6 +1492,11 @@ Type SemanticAnalyzer::analyzeFieldAccessExpr(FieldAccessExpr& expr) {
             expr.fieldIndex = static_cast<int>(i);
             expr.inferredType = field.type;
 
+            if (field.type == Type::IntArray) {
+                expr.inferredArraySize = field.arraySize;
+                expr.inferredStructName = field.typeName;
+            }
+
             if (field.type == Type::Struct) {
                 expr.inferredStructName = field.typeName;
             }
@@ -1110,6 +1543,7 @@ Type SemanticAnalyzer::analyzeVariableExpr(VariableExpr& expr) {
 
     if (symbol->type == Type::IntArray) {
         expr.inferredArraySize = symbol->arraySize;
+        expr.inferredStructName = symbol->structName;
     }
 
     if (symbol->type == Type::Struct || symbol->type == Type::Generic) {

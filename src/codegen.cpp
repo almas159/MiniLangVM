@@ -6,6 +6,91 @@
 
 namespace minilang {
 
+static Type arrayElementTypeFromEncodedNameCodegen(const std::string& encoded) {
+    if (encoded.empty() || encoded == "__array:int:") {
+        return Type::Int;
+    }
+
+    if (encoded == "__array:uint:") {
+        return Type::UInt;
+    }
+
+    if (encoded == "__array:float64:") {
+        return Type::Float;
+    }
+
+    if (encoded == "__array:bool:") {
+        return Type::Bool;
+    }
+
+    if (encoded == "__array:string:") {
+        return Type::String;
+    }
+
+    if (encoded.rfind("__array:struct:", 0) == 0) {
+        return Type::Struct;
+    }
+
+    return Type::Unknown;
+}
+
+static int arrayElementSizeOfCodegen(Type type) {
+    switch (type) {
+        case Type::Bool:
+            return 1;
+
+        case Type::Int:
+        case Type::UInt:
+            return 4;
+
+        case Type::Float:
+            return 8;
+
+        case Type::String:
+        case Type::Struct:
+        case Type::Generic:
+        case Type::IntArray:
+            return 8;
+
+        case Type::Void:
+        case Type::Unknown:
+            return 0;
+    }
+
+    return 0;
+}
+
+static std::string arrayTypeNameCodegen(const std::string& encoded) {
+    if (encoded.empty() || encoded == "__array:int:") {
+        return "int[]";
+    }
+
+    if (encoded == "__array:uint:") {
+        return "uint[]";
+    }
+
+    if (encoded == "__array:float64:") {
+        return "float64[]";
+    }
+
+    if (encoded == "__array:bool:") {
+        return "bool[]";
+    }
+
+    if (encoded == "__array:string:") {
+        return "string[]";
+    }
+
+    const std::string prefix = "__array:struct:";
+
+    if (encoded.rfind(prefix, 0) == 0) {
+        return encoded.substr(prefix.size()) + "[]";
+    }
+
+    return "array";
+}
+
+
 void BytecodeGenerator::setDiagnostic(SourceLocation location, const std::string& message) {
     if (diagnostic_) {
         return;
@@ -19,6 +104,10 @@ void BytecodeGenerator::failVoid(SourceLocation location, const std::string& mes
 }
 
 static std::string metaTypeName(const Expr& expr) {
+    if (expr.inferredType == Type::IntArray) {
+        return arrayTypeNameCodegen(expr.inferredStructName);
+    }
+
     if ((expr.inferredType == Type::Struct || expr.inferredType == Type::Generic) &&
         !expr.inferredStructName.empty()) {
         return expr.inferredStructName;
@@ -46,7 +135,12 @@ static int metaSizeOf(const Expr& expr) {
 
         case Type::IntArray:
             if (expr.inferredArraySize > 0) {
-                return expr.inferredArraySize * 4;
+                Type elementType = arrayElementTypeFromEncodedNameCodegen(expr.inferredStructName);
+                int elementSize = arrayElementSizeOfCodegen(elementType);
+
+                if (elementSize > 0) {
+                    return expr.inferredArraySize * elementSize;
+                }
             }
 
             return 8;
@@ -275,9 +369,18 @@ void BytecodeGenerator::generateAssignStmt(AssignStmt& stmt) {
 }
 
 void BytecodeGenerator::generateArrayAssignStmt(ArrayAssignStmt& stmt) {
+    if (stmt.arrayExpr) {
+        generateExpr(*stmt.arrayExpr);
+        generateExpr(*stmt.index);
+        generateExpr(*stmt.value);
+
+        emit(Instruction(OpCode::StoreIndex, -1, stmt.loc));
+        return;
+    }
+
     if (stmt.localIndex < 0) {
         failVoid(stmt.loc, "internal error: array assignment target has no local index");
-    return;
+        return;
     }
 
     generateExpr(*stmt.index);
@@ -573,9 +676,16 @@ void BytecodeGenerator::generateArrayLiteralExpr(ArrayLiteralExpr& expr) {
 }
 
 void BytecodeGenerator::generateIndexExpr(IndexExpr& expr) {
+    if (expr.arrayExpr) {
+        generateExpr(*expr.arrayExpr);
+        generateExpr(*expr.index);
+        emit(Instruction(OpCode::LoadIndex, -1, expr.loc));
+        return;
+    }
+
     if (expr.localIndex < 0) {
-        failVoid(expr.loc, "internal error: index expression has no local index");
-    return;
+        failVoid(expr.loc, "internal error: array access has no local index");
+        return;
     }
 
     generateExpr(*expr.index);

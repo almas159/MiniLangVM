@@ -1,12 +1,17 @@
 #pragma once
+
+#include "error.hpp"
 #include "token.hpp"
 #include <string>
+
+
+namespace minilang {
 
 class Lexer {
 public:
     explicit Lexer(std::string source);
 
-    Token nextToken();
+    Result<Token> nextTokenExpected();
 
 private:
     std::string source_;
@@ -22,13 +27,18 @@ private:
 
     SourceLocation currentLocation() const;
 
-    void skipWhitespaceAndComments();
+    Result<void> skipWhitespaceAndComments();
 
     Token makeToken(TokenType type, const std::string& lexeme, SourceLocation location) const;
 
-    Token identifierOrKeyword();
-    Token number();
-    Token stringLiteral();
+    Result<Token> identifierOrKeyword();
+    Result<Token> number();
+    Result<Token> stringLiteral();
 
     bool match(char expected);
+
+    Result<Token> lexicalError(SourceLocation location, const std::string& message) const;
+    Result<void> lexicalVoidError(SourceLocation location, const std::string& message) const;
 };
+
+} 

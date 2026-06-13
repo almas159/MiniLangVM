@@ -1,16 +1,33 @@
 #include "ast.hpp"
 #include <string>
 
+namespace minilang {
+
 std::string typeToString(Type type) {
     switch (type) {
         case Type::Int:
             return "int";
+
+        case Type::UInt:
+            return "uint";
+
+        case Type::IntArray:
+            return "int32[]";
+
+        case Type::Float:
+            return "float64";
+
+        case Type::Struct:
+            return "struct";
 
         case Type::Bool:
             return "bool";
 
         case Type::String:
             return "string";
+
+        case Type::Generic:
+            return "generic";
 
         case Type::Void:
             return "void";
@@ -51,6 +68,21 @@ std::string binaryOpToString(BinaryOp op) {
         case BinaryOp::GreaterEqual:
             return ">=";
 
+        case BinaryOp::BitAnd:
+            return "&";
+
+        case BinaryOp::BitOr:
+            return "|";
+
+        case BinaryOp::BitXor:
+            return "^";
+
+        case BinaryOp::ShiftLeft:
+            return "<<";
+
+        case BinaryOp::ShiftRight:
+            return ">>";
+
         case BinaryOp::Equal:
             return "==";
 
@@ -69,6 +101,10 @@ std::string binaryOpToString(BinaryOp op) {
 
 std::string unaryOpToString(UnaryOp op) {
     switch (op) {
+        case UnaryOp::BitNot:
+            return "~";
+
+
         case UnaryOp::Negate:
             return "-";
 
@@ -78,3 +114,5 @@ std::string unaryOpToString(UnaryOp op) {
 
     return "?";
 }
+
+} 

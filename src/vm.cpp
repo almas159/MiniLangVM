@@ -923,13 +923,6 @@ void VM::executeMakeArray(const Instruction& instruction) {
     for (int i = count - 1; i >= 0; --i) {
         Value value = pop(instruction.location);
 
-        if (value.type != Type::Int) {
-            throw RuntimeError(
-                instruction.location,
-                "int32[] can contain only int values"
-            );
-        }
-
         elements[i] = value;
     }
 
@@ -937,16 +930,21 @@ void VM::executeMakeArray(const Instruction& instruction) {
 }
 
 void VM::executeLoadIndex(const Instruction& instruction) {
-    checkLocalIndex(instruction.intArg, instruction.location);
+    Value indexValue = pop(instruction.location);
+    int index = requireInt(indexValue, instruction.location, "array index");
 
-    Value& arrayValue = currentFrame().locals[instruction.intArg];
+    Value arrayValue;
+
+    if (instruction.intArg >= 0) {
+        checkLocalIndex(instruction.intArg, instruction.location);
+        arrayValue = currentFrame().locals[instruction.intArg];
+    } else {
+        arrayValue = pop(instruction.location);
+    }
 
     if (arrayValue.type != Type::IntArray) {
         throw RuntimeError(instruction.location, "LOAD_INDEX target is not an array");
     }
-
-    Value indexValue = pop(instruction.location);
-    int index = requireInt(indexValue, instruction.location, "array index");
 
     auto array = std::get<std::shared_ptr<ArrayValue>>(arrayValue.data);
 
@@ -958,21 +956,18 @@ void VM::executeLoadIndex(const Instruction& instruction) {
 }
 
 void VM::executeStoreIndex(const Instruction& instruction) {
-    checkLocalIndex(instruction.intArg, instruction.location);
-
     Value value = pop(instruction.location);
     Value indexValue = pop(instruction.location);
-
-    if (value.type != Type::Int) {
-        throw RuntimeError(
-            instruction.location,
-            "int32[] element assignment expects int value"
-        );
-    }
-
     int index = requireInt(indexValue, instruction.location, "array index");
 
-    Value& arrayValue = currentFrame().locals[instruction.intArg];
+    Value arrayValue;
+
+    if (instruction.intArg >= 0) {
+        checkLocalIndex(instruction.intArg, instruction.location);
+        arrayValue = currentFrame().locals[instruction.intArg];
+    } else {
+        arrayValue = pop(instruction.location);
+    }
 
     if (arrayValue.type != Type::IntArray) {
         throw RuntimeError(instruction.location, "STORE_INDEX target is not an array");

@@ -1,0 +1,12 @@
+int main() {
+    int32 x = 42;
+    uint u = cast<uint>(x);
+    int32 y = cast<int32>(u);
+
+    print("u = ", u, "\n");
+    print("y = ", y, "\n");
+
+    assert(y == 42, "uint cast failed");
+
+    return 0;
+}

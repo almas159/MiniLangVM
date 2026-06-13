@@ -7,6 +7,32 @@
 
 namespace minilang {
 
+static std::string encodeArrayElementTypeName(Type type, const std::string& typeName) {
+    switch (type) {
+        case Type::Int:
+            return "__array:int:";
+
+        case Type::UInt:
+            return "__array:uint:";
+
+        case Type::Float:
+            return "__array:float64:";
+
+        case Type::Bool:
+            return "__array:bool:";
+
+        case Type::String:
+            return "__array:string:";
+
+        case Type::Struct:
+            return "__array:struct:" + typeName;
+
+        default:
+            return "__array:unknown:";
+    }
+}
+
+
 Parser::Parser(Lexer& lexer)
     : lexer_(lexer),
       current_(TokenType::EndOfFile, "", SourceLocation()) {
@@ -182,96 +208,70 @@ Type Parser::parseType() {
     lastParsedArraySize_ = -1;
     lastParsedTypeName_.clear();
 
-    if (match(TokenType::KwInt)) {
-        if (match(TokenType::LBracket)) {
-            Token sizeToken = expect(TokenType::IntLiteral, "expected array size");
-            expect(TokenType::RBracket, "expected ']' after array size");
+    Type baseType = Type::Unknown;
+    std::string baseTypeName;
 
-            if (sizeToken.intValue <= 0) {
-                return fail<Type>(sizeToken.location, "array size must be positive");
-            }
-
-            lastParsedArraySize_ = sizeToken.intValue;
-            return Type::IntArray;
-        }
-
-        return Type::Int;
-    }
-
-    if (match(TokenType::KwInt32)) {
-        if (match(TokenType::LBracket)) {
-            Token sizeToken = expect(TokenType::IntLiteral, "expected array size");
-            expect(TokenType::RBracket, "expected ']' after array size");
-
-            if (sizeToken.intValue <= 0) {
-                return fail<Type>(sizeToken.location, "array size must be positive");
-            }
-
-            lastParsedArraySize_ = sizeToken.intValue;
-            return Type::IntArray;
-        }
-
-        return Type::Int;
-    }
-
-    if (match(TokenType::KwUInt)) {
-        return Type::UInt;
-    }
-
-    if (match(TokenType::KwUInt32)) {
-        return Type::UInt;
-    }
-
-    if (match(TokenType::KwFloat32)) {
-        return Type::Float;
-    }
-
-    if (match(TokenType::KwFloat64)) {
-        return Type::Float;
-    }
-
-    if (match(TokenType::KwBool)) {
-        return Type::Bool;
-    }
-
-    if (match(TokenType::KwString)) {
-        return Type::String;
-    }
-
-    if (match(TokenType::KwVoid)) {
-        return Type::Void;
-    }
-
-    if (match(TokenType::KwUnit)) {
-        return Type::Void;
-    }
-
-    if (match(TokenType::KwVar)) {
-        return Type::Unknown;
-    }
-
-    if (check(TokenType::Identifier)) {
+    if (match(TokenType::KwInt) || match(TokenType::KwInt32)) {
+        baseType = Type::Int;
+    } else if (match(TokenType::KwUInt) || match(TokenType::KwUInt32)) {
+        baseType = Type::UInt;
+    } else if (match(TokenType::KwFloat32) || match(TokenType::KwFloat64)) {
+        baseType = Type::Float;
+    } else if (match(TokenType::KwBool)) {
+        baseType = Type::Bool;
+    } else if (match(TokenType::KwString)) {
+        baseType = Type::String;
+    } else if (match(TokenType::KwVoid) || match(TokenType::KwUnit)) {
+        baseType = Type::Void;
+    } else if (match(TokenType::KwVar)) {
+        baseType = Type::Unknown;
+    } else if (check(TokenType::Identifier)) {
         auto aliasFound = typeAliases_.find(current_.lexeme);
 
         if (aliasFound != typeAliases_.end()) {
+            baseType = aliasFound->second.type;
             lastParsedArraySize_ = aliasFound->second.arraySize;
-            Type type = aliasFound->second.type;
+            lastParsedTypeName_ = aliasFound->second.typeName;
             advance();
-            return type;
+            return baseType;
         }
 
         if (structTypeNames_.find(current_.lexeme) != structTypeNames_.end()) {
-            lastParsedTypeName_ = current_.lexeme;
+            baseType = Type::Struct;
+            baseTypeName = current_.lexeme;
             advance();
-            return Type::Struct;
+        } else {
+            baseType = Type::Generic;
+            baseTypeName = current_.lexeme;
+            advance();
         }
-
-        lastParsedTypeName_ = current_.lexeme;
-        advance();
-        return Type::Generic;
+    } else {
+        return fail<Type>(current_.location, "expected type");
     }
 
-    return fail<Type>(current_.location, "expected type");
+    if (match(TokenType::LBracket)) {
+        if (baseType == Type::Void || baseType == Type::Unknown ||
+            baseType == Type::Generic || baseType == Type::IntArray) {
+            return fail<Type>(current_.location, "invalid array element type");
+        }
+
+        Token sizeToken = expect(TokenType::IntLiteral, "expected array size");
+        expect(TokenType::RBracket, "expected ']' after array size");
+
+        if (sizeToken.intValue <= 0) {
+            return fail<Type>(sizeToken.location, "array size must be positive");
+        }
+
+        lastParsedArraySize_ = sizeToken.intValue;
+        lastParsedTypeName_ = encodeArrayElementTypeName(baseType, baseTypeName);
+        return Type::IntArray;
+    }
+
+    if (baseType == Type::Struct || baseType == Type::Generic) {
+        lastParsedTypeName_ = baseTypeName;
+    }
+
+    return baseType;
 }
 
 Result<std::unique_ptr<Program>> Parser::parseProgramExpected() {
@@ -380,6 +380,7 @@ std::vector<StructFieldDecl> Parser::parseStructFields() {
 
         Type fieldType = parseType();
         std::string fieldTypeName = lastParsedTypeName_;
+        int fieldArraySize = lastParsedArraySize_;
 
         if (fieldType == Type::Void || fieldType == Type::Unknown) {
             return fail<std::vector<StructFieldDecl>>(loc, "invalid struct field type");
@@ -393,7 +394,8 @@ std::vector<StructFieldDecl> Parser::parseStructFields() {
             fieldType,
             fieldTypeName,
             nameToken.lexeme,
-            loc
+            loc,
+            fieldArraySize
         );
     }
 
@@ -416,6 +418,7 @@ std::unique_ptr<TypeAliasDecl> Parser::parseTypeAliasDecl() {
 
     Type targetType = parseType();
     int arraySize = lastParsedArraySize_;
+    std::string targetTypeName = lastParsedTypeName_;
 
     if (targetType == Type::Unknown || targetType == Type::Void) {
         return fail<std::unique_ptr<TypeAliasDecl>>(loc, "invalid type alias target");
@@ -423,7 +426,7 @@ std::unique_ptr<TypeAliasDecl> Parser::parseTypeAliasDecl() {
 
     expect(TokenType::Semicolon, "expected ';' after type alias declaration");
 
-    typeAliases_[nameToken.lexeme] = TypeAliasInfo{targetType, arraySize};
+    typeAliases_[nameToken.lexeme] = TypeAliasInfo{targetType, arraySize, targetTypeName};
 
     return std::make_unique<TypeAliasDecl>(
         nameToken.lexeme,
@@ -661,6 +664,28 @@ std::unique_ptr<Stmt> Parser::parseIdentifierStatement() {
 
     if (match(TokenType::Dot)) {
         Token fieldToken = expect(TokenType::Identifier, "expected field name after '.'");
+
+        if (match(TokenType::LBracket)) {
+            auto arrayExpr = std::make_unique<FieldAccessExpr>(
+                nameToken.lexeme,
+                fieldToken.lexeme,
+                nameToken.location
+            );
+
+            auto index = parseExpression();
+
+            expect(TokenType::RBracket, "expected ']' after array index");
+            expect(TokenType::Assign, "expected '=' after array element");
+
+            auto value = parseExpression();
+
+            return std::make_unique<ArrayAssignStmt>(
+                std::move(arrayExpr),
+                std::move(index),
+                std::move(value),
+                nameToken.location
+            );
+        }
 
         expect(TokenType::Assign, "expected '=' after struct field");
 
@@ -1718,11 +1743,25 @@ std::unique_ptr<Expr> Parser::parsePrimary() {
         if (match(TokenType::Dot)) {
             Token fieldToken = expect(TokenType::Identifier, "expected field name after '.'");
 
-            return std::make_unique<FieldAccessExpr>(
+            auto fieldExpr = std::make_unique<FieldAccessExpr>(
                 token.lexeme,
                 fieldToken.lexeme,
                 token.location
             );
+
+            if (match(TokenType::LBracket)) {
+                auto index = parseExpression();
+
+                expect(TokenType::RBracket, "expected ']' after array index");
+
+                return std::make_unique<IndexExpr>(
+                    std::move(fieldExpr),
+                    std::move(index),
+                    token.location
+                );
+            }
+
+            return fieldExpr;
         }
 
         return std::make_unique<VariableExpr>(
