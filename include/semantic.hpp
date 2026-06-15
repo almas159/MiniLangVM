@@ -141,6 +141,7 @@ private:
     Type analyzeUnaryExpr(UnaryExpr& expr);
 
     bool canImplicitlyConvert(Type from, Type to) const;
+    int implicitConversionCost(Type from, Type to) const;
     bool sameType(Type left, Type right) const;
     bool canAssign(Type target, Type source) const;
 };

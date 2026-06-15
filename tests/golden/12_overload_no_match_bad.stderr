@@ -1,0 +1,1 @@
+tests/golden/12_overload_no_match_bad.ml:6:12: error: no matching overload for function 'f'

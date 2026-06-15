@@ -1,0 +1,5 @@
+int main() {
+    int x = 2 + 3 * 4;
+    print("x = ", x, "\n");
+    return x;
+}

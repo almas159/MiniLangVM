@@ -1,0 +1,1 @@
+tests/golden/02_type_error.ml:2:13: error: cannot initialize int variable 'x' with string value

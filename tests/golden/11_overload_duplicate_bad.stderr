@@ -1,0 +1,1 @@
+tests/golden/11_overload_duplicate_bad.ml:5:1: error: function 'f' with the same parameter types is already declared

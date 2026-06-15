@@ -32,6 +32,41 @@ static Result<std::string> readFile(const std::string& path) {
     return buffer.str();
 }
 
+static Result<std::string> readStandardLibrary() {
+    const char* paths[] = {
+        "stdlib/prelude.ml",
+        "stdlib/io.ml",
+        "stdlib/math.ml",
+        "stdlib/string.ml",
+        "stdlib/array.ml",
+        "stdlib/memory.ml",
+    };
+
+    std::ostringstream buffer;
+
+    for (const char* path : paths) {
+        Result<std::string> part = readFile(path);
+
+        if (!part) {
+            return std::unexpected(
+                Diagnostic(
+                    SourceLocation(),
+                    "cannot load standard library file '" +
+                    std::string(path) +
+                    "': " +
+                    part.error().message
+                )
+            );
+        }
+
+        buffer << "\n";
+        buffer << *part;
+        buffer << "\n";
+    }
+
+    return buffer.str();
+}
+
 static double millisecondsSince(std::chrono::steady_clock::time_point start,
                                 std::chrono::steady_clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
@@ -53,6 +88,7 @@ static void printUsage() {
         << "  --emit-asm        generate x86-64 NASM assembly and exit\n"
         << "  --no-run          compile only, do not run VM\n"
         << "  --time-phases     print time spent in compiler phases\n"
+        << "  --use-stdlib      prepend MiniLangVM standard library files\n"
         << "  --help            show this help message\n";
 }
 
@@ -88,6 +124,7 @@ int main(int argc, char** argv) {
     bool shouldEmitAsm = false;
     bool shouldRun = true;
     bool shouldTimePhases = false;
+    bool shouldUseStdlib = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -125,6 +162,11 @@ int main(int argc, char** argv) {
 
         if (arg == "--time-phases") {
             shouldTimePhases = true;
+            continue;
+        }
+
+        if (arg == "--use-stdlib") {
+            shouldUseStdlib = true;
             continue;
         }
 
@@ -183,6 +225,32 @@ int main(int argc, char** argv) {
         }
 
         std::string source = *sourceResult;
+
+        if (shouldUseStdlib) {
+            auto stdlibStart = std::chrono::steady_clock::now();
+            Result<std::string> stdlibResult = readStandardLibrary();
+            auto stdlibEnd = std::chrono::steady_clock::now();
+
+            if (shouldTimePhases) {
+                printPhaseTime("read-stdlib", millisecondsSince(stdlibStart, stdlibEnd));
+            }
+
+            if (!stdlibResult) {
+                const Diagnostic& diagnostic = stdlibResult.error();
+
+                std::cerr << sourcePath
+                          << ":" << diagnostic.location.line
+                          << ":" << diagnostic.location.column
+                          << ": error: "
+                          << diagnostic.message
+                          << std::endl;
+
+                return 1;
+            }
+
+            source += "\n";
+            source += *stdlibResult;
+        }
 
         if (shouldDumpTokens) {
             Result<void> dumpResult = dumpTokens(source);

@@ -2230,24 +2230,37 @@ Type SemanticAnalyzer::analyzeUnaryExpr(UnaryExpr& expr) {
     return fail<Type>(expr.loc, "unknown unary operator");
 }
 
-bool SemanticAnalyzer::canImplicitlyConvert(Type from, Type to) const {
-    if (from == to) {
-        return true;
-    }
-
-    // A.3.1: implicit conversions used only during overload resolution.
-    // The safe numeric widening supported here:
-    //   int  -> float64
-    //   uint -> float64
-    if ((from == Type::Int || from == Type::UInt) && to == Type::Float) {
-        return true;
-    }
-
-    return false;
-}
-
 bool SemanticAnalyzer::sameType(Type left, Type right) const {
     return left == right;
 }
 
-} 
+}
+
+
+int minilang::SemanticAnalyzer::implicitConversionCost(minilang::Type from, minilang::Type to) const {
+    if (from == to) {
+        return 0;
+    }
+
+    auto isNumeric = [](minilang::Type t) {
+        return t == minilang::Type::Int ||
+               t == minilang::Type::UInt ||
+               t == minilang::Type::Float;
+    };
+
+    /*
+     * A.3.1:
+     * Неявные преобразования используются только при выборе перегрузки.
+     * Обычные бинарные операции остаются строгими.
+     */
+    if (isNumeric(from) && isNumeric(to)) {
+        return 1;
+    }
+
+    return -1;
+}
+
+bool minilang::SemanticAnalyzer::canImplicitlyConvert(minilang::Type from, minilang::Type to) const {
+    return implicitConversionCost(from, to) >= 0;
+}
+

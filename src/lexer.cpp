@@ -104,20 +104,27 @@ Result<void> Lexer::skipWhitespaceAndComments() {
             advance();
             advance();
 
-            bool closed = false;
+            int depth = 1;
 
-            while (!isAtEnd()) {
+            while (!isAtEnd() && depth > 0) {
+                if (peek() == '/' && peekNext() == '*') {
+                    advance();
+                    advance();
+                    depth++;
+                    continue;
+                }
+
                 if (peek() == '*' && peekNext() == '/') {
                     advance();
                     advance();
-                    closed = true;
-                    break;
+                    depth--;
+                    continue;
                 }
 
                 advance();
             }
 
-            if (!closed) {
+            if (depth != 0) {
                 return lexicalVoidError(commentStart, "unterminated block comment");
             }
 

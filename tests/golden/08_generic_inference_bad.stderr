@@ -1,0 +1,1 @@
+tests/golden/08_generic_inference_bad.ml:10:13: error: no matching overload for function 'choose'
